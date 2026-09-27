@@ -1,0 +1,41 @@
+{
+  "dataset_id": "wooden_space_8week",
+  "currency": "INR",
+  "bucket": "week",
+  "periods": ["W45", "W46", "W47", "W48", "W49", "W50", "W51", "W52"],
+  "products": [
+    {
+      "id": "bed",
+      "unit": "unit",
+      "demand": [150, 250, 100, 350, 150, 100, 50, 50],
+      "selling_price": 1000,
+      "conversion_cost": 100,
+      "holding_cost": 1,
+      "backlog_cost": 100,
+      "resources": {"cutting": 12, "panelling": 22, "assembly_packing": 33},
+      "bom": {"head_board": 1, "leg_board": 1, "centre_board": 1}
+    },
+    {
+      "id": "table",
+      "unit": "unit",
+      "demand": [200, 150, 200, 300, 250, 50, 20, 150],
+      "selling_price": 1000,
+      "conversion_cost": 100,
+      "holding_cost": 1,
+      "backlog_cost": 100,
+      "resources": {"cutting": 7, "panelling": 18, "assembly_packing": 13},
+      "bom": {"top_board": 1, "table_leg": 4}
+    }
+  ],
+  "resources": [
+    {"id": "cutting",          "capacity": [4800, 4800, 4800, 4800, 4800, 4800, 4800, 4800]},
+    {"id": "panelling",        "capacity": [7200, 7200, 7200, 7200, 7200, 7200, 7200, 7200]},
+    {"id": "assembly_packing", "capacity": [52800, 52800, 52800, 52800, 52800, 52800, 52800, 52800]}
+  ],
+  "_notes": {
+    "unit_minutes_source": "Best-case routing: bed = head 5 + leg 3 + centre 5 cut minutes (T1.a min across machines); bed panelling 10+4+8 (T1.b min); table panelling 6 + 4x3; bed assembly 25 min best crew (T2.a) + packing 8 (T2.b); table 8 + 5.",
+    "capacity_source": "2 cutting machines x 2400 min (5-day week), 3 panelling machines x 2400, 22 people x 2400 person-min.",
+    "sixth_day": "Raise capacity arrays to 2880/8640/63360 for weeks where the optional 6th day is worked.",
+    "demand_conflict": "The source DOCX prints week-48 beds = 350; the companion XLSX cell L20 holds 150. Both variants were solved; this file carries the conservative DOCX series."
+  }
+}
