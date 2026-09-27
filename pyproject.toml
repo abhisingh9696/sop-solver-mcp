@@ -4,16 +4,24 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sop-solver-mcp"
-version = "0.1.0"
-description = "Standalone Sales & Operations Planning server — LP engines + Jev gate (extracted from the Wooden Space solve)"
+version = "0.2.0"
+description = "Standalone Sales & Operations Planning MCP server: 24 analytical methods (LP/MILP planning, MRP, inventory policies, forecasting incl. ARIMA, P&L, simulation), the full evidence-linked case workflow, and the Jev decision gate. Worked example included."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
   "numpy>=1.24",
   "scipy>=1.10",
+  "statsmodels>=0.14",
+  "pydantic>=2.5",
   "mcp>=1.2",
+  "pypdf>=4.0",
+  "openpyxl>=3.1",
+  "uvicorn>=0.30",
 ]
+
+[project.optional-dependencies]
+sandbox = ["docker"]
 
 [project.scripts]
 sop-solver = "sop_solver.server:main"

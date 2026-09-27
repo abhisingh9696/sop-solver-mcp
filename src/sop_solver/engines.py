@@ -1,320 +1,227 @@
-"""S&OP planning engines — the standalone capability extracted from the Wooden Space solve.
-
-Every engine here is pure Python: scipy LP + numpy. No LLM, no network, no DB.
-The MCP layer (server.py) exposes them as tools; the Jev gate (jev.py) decides
-when a planning question is confident enough to act without asking again.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-
+"""Numerical tools with declared assumptions and reproducible outputs."""
+import ast, math, operator, json
 import numpy as np
-from scipy.optimize import Bounds, LinearConstraint, linprog, milp
+from scipy.optimize import linprog, milp, Bounds, LinearConstraint
+from scipy import stats
+METHODS={
+ 'descriptive':'Finite numeric observations -> count, mean, spread, quantiles.',
+ 'formula':'Named scalar inputs plus ordered arithmetic expressions; no Python execution.',
+ 'sensitivity':'Explicit parameter scenarios evaluated using the same formula model.',
+ 'cashflow':'Explicit cash flows at equal periods and discount rate; NPV and funding exposure.',
+ 'linear_program':'User-formulated continuous LP with independently computed residuals and duals.',
+ 'milp':'User-formulated mixed integer linear model; reports solver bounds/gap and residuals.',
+ 'welch_ttest':'Two independent samples; Welch comparison, effect estimate and interval.',
+ 'ols':'Linear least squares with intercept, rank check and descriptive fit diagnostics.',
+ 'forecast':'Rolling-origin baseline selection; empirical bands, no calibrated-coverage claim.',
+ 'sop_plan':'Single-echelon shared-resource and finite-material planning module.',
+ 'plan_multi_period':'Multi-period produce/carry/backlog LP with shared resources, overtime capacity and chase/level strategy shaping.',
+ 'rough_cut':'Load-vs-capacity screen for a proposed production plan; flags overloaded periods.',
+ 'mrp_run':'BOM explosion with net requirements and lot sizing (lot-for-lot, fixed, max stock).',
+ 'inventory_policy':'Newsvendor, safety stock / reorder point and (s,S) policy replay.',
+ 'plan_pnl':'One-set-of-numbers finance view (P&L, cash, DSO/DIO/CCC) for a validated S&OP plan.',
+ 'simulate':'Template shock scenarios (demand, supplier, capacity, price) with re-optimization.',
+ 'holt':'Holt double exponential smoothing with fitted or supplied alpha/beta.',
+ 'holt_winters':'Holt-Winters seasonal smoothing (additive decomposition) with fitted or supplied constants.',
+ 'forecast_ladder':'Runs baselines plus SMA/WMA/EMA/SES/Holt/Holt-Winters and selects by rolling-origin MAE.',
+ 'forecast_adjust':'Judgmental per-period multiplier overlay on a statistical forecast.',
+ 'forecast_track':'Forecast-vs-actual diagnostics: bias, MAPE, RMSE, MASE, tracking signal.',
+ 'arima':'ARIMA/SARIMA via statsmodels with supplied orders and residual-based bands; no auto-search.',
+ 'regression_forecast':'Least-squares demand forecast on host-supplied exogenous features (association, not causation).',
+ 'multi_echelon_inventory':'Two-echelon safety-stock pooling: warehouse + stores vs decentralized sizing.',
+ 'python_sandbox':'Opt-in Docker-isolated Python job; disabled unless operator provisions runner.'}
 
+def array(v,ndim=1,max_size=50000):
+    a=np.asarray(v,dtype=float)
+    if a.ndim!=ndim or not a.size or a.size>max_size or not np.isfinite(a).all():raise ValueError('invalid finite array/dimensions/size')
+    return a
 
-# ---------------------------------------------------------------------------
-# Engine 1: plan_multi_period — produce/carry/backlog LP with shared resources
-# ---------------------------------------------------------------------------
+def scalar(v):
+    if type(v) not in (float,int) or not math.isfinite(v) or abs(v)>1e100:raise ValueError('invalid finite scalar')
+    return float(v)
 
-def plan_multi_period(data: dict, mode: str = "economic") -> dict:
-    """Multi-period produce/carry/backlog LP.
+OPS={ast.Add:operator.add,ast.Sub:operator.sub,ast.Mult:operator.mul,ast.Div:operator.truediv,ast.Pow:operator.pow}
+FUNCS={'abs':abs,'min':min,'max':max,'sqrt':math.sqrt,'log':math.log,'exp':math.exp}
+def evaluate(expression,names):
+    if not isinstance(expression,str) or len(expression)>2000:raise ValueError('expression too long')
+    tree=ast.parse(expression,mode='eval')
+    if len(list(ast.walk(tree)))>100:raise ValueError('expression too complex')
+    def visit(n):
+        if isinstance(n,ast.Constant):return scalar(n.value)
+        if isinstance(n,ast.Name) and n.id in names:return scalar(names[n.id])
+        if isinstance(n,ast.UnaryOp) and isinstance(n.op,(ast.USub,ast.UAdd)):
+            v=visit(n.operand);return -v if isinstance(n.op,ast.USub) else v
+        if isinstance(n,ast.BinOp) and type(n.op) in OPS:
+            a,b=visit(n.left),visit(n.right)
+            if isinstance(n.op,ast.Pow) and abs(b)>100:raise ValueError('exponent too large')
+            return scalar(OPS[type(n.op)](a,b))
+        if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id in FUNCS and not n.keywords:
+            if not 1<=len(n.args)<=20:raise ValueError('invalid function arguments')
+            return scalar(FUNCS[n.func.id](*[visit(x) for x in n.args]))
+        raise ValueError('unsupported expression node; attributes/imports/comprehensions forbidden')
+    return scalar(visit(tree.body))
 
-    data = {
-      "periods": ["W45", ...],
-      "products": [{"id": "bed", "demand": [...], "resources": {"panelling": 22},
-                    "holding_cost": 1, "backlog_cost": 100, "conversion_cost": 100,
-                    "selling_price": 1000, "production_limit": [..] (optional)}],
-      "resources": [{"id": "panelling", "capacity": [7200, ...]}],
-    }
-    Returns production/inventory/backlog paths, utilisation and per-period
-    shadow prices (marginal value of one more capacity minute).
-    """
-    periods = data["periods"]
-    prods = data["products"]
-    res = data["resources"]
-    nw = len(periods)
-    npd = len(prods)
-    nv = nw * npd * 3
+def formula(i):
+    if not isinstance(i.get('parameters'),dict) or not isinstance(i.get('expressions'),dict):raise ValueError('parameters and expressions objects required')
+    if len(i['parameters'])>100 or not 1<=len(i['expressions'])<=100:raise ValueError('formula size limit')
+    names={k:scalar(v) for k,v in i['parameters'].items()}; out={}
+    for k,e in i['expressions'].items():
+        if not k.isidentifier() or k in names or k in FUNCS:raise ValueError('invalid/duplicate output name')
+        out[k]=evaluate(e,names);names[k]=out[k]
+    checks=[]
+    for check in i.get('checks',[]):
+        left=evaluate(check['left'],names);right=evaluate(check['right'],names)
+        tol=scalar(check.get('tolerance',1e-7))
+        if not 0<=tol<=1:raise ValueError('tolerance outside allowed range')
+        passed={'eq':abs(left-right)<=tol,'le':left<=right+tol,'ge':left+tol>=right}.get(check['relation'])
+        if passed is None:raise ValueError('check relation must be eq, le, ge')
+        checks.append({'left':left,'right':right,'relation':check['relation'],'passed':passed})
+    return {'outputs':out,'checks':checks,'numeric_valid':all(c['passed'] for c in checks),
+            'validation_basis':'Expression execution and supplied checks; host must assess formulation and units.'}
 
-    def V(pi, kind, t):
-        base = {"P": 0, "I": 1, "U": 2}[kind]
-        return (base * npd + pi) * nw + t
+def linear(i,integer=False,timeout=30):
+    c=array(i['c']);n=len(c)
+    if n>1000:raise ValueError('at most 1000 variables')
+    rows=[];lbs=[];ubs=[]
+    for ak,bk,is_eq in [('A_ub','b_ub',False),('A_eq','b_eq',True)]:
+        if ak in i:
+            a=array(i[ak],2,max_size=200000);b=array(i[bk])
+            if a.shape!=(len(b),n):raise ValueError('constraint dimensions mismatch')
+            rows.extend(a.tolist());lbs.extend(b.tolist() if is_eq else [-np.inf]*len(b));ubs.extend(b.tolist())
+    bounds=i.get('bounds',[[0,None] for _ in range(n)])
+    if len(bounds)!=n:raise ValueError('bounds length mismatch')
+    lo=[];hi=[]
+    for pair in bounds:
+        if len(pair)!=2:raise ValueError('two bounds required')
+        l=-np.inf if pair[0] is None else scalar(pair[0]);h=np.inf if pair[1] is None else scalar(pair[1])
+        if l>h:raise ValueError('lower exceeds upper')
+        lo.append(l);hi.append(h)
+    integrality=i.get('integrality',[0]*n)
+    if len(integrality)!=n or any(type(v)!=int or v not in [0,1] for v in integrality):raise ValueError('integrality must be 0/1 per variable')
+    if integer:
+        con=LinearConstraint(np.asarray(rows),lbs,ubs) if rows else None
+        r=milp(c,integrality=integrality,bounds=Bounds(lo,hi),constraints=con,options={'time_limit':timeout})
+    else:
+        if any(integrality):raise ValueError('integer variables require milp')
+        r=linprog(c,A_ub=i.get('A_ub'),b_ub=i.get('b_ub'),A_eq=i.get('A_eq'),b_eq=i.get('b_eq'),bounds=bounds,method='highs',options={'time_limit':timeout})
+    if not r.success:return {'status':'INFEASIBLE' if r.status==2 else 'NOT_OPTIMAL','solver_status':int(r.status),'message':str(r.message),'numeric_valid':False}
+    x=np.asarray(r.x);viol=[]
+    for row,l,h in zip(rows,lbs,ubs):
+        v=float(np.dot(row,x));viol.append(max(0,l-v,v-h))
+    viol.extend(max(0,l-v,v-h) for l,v,h in zip(lo,x,hi))
+    integ=max([abs(v-round(v)) for v,k in zip(x,integrality) if k]+[0.])
+    residual=max(viol+[0.]); objective=float(c@x)
+    duals={}
+    if not integer and getattr(r,'ineqlin',None) is not None and getattr(r.ineqlin,'marginals',None) is not None:
+        duals['constraint_shadow_prices']=[float(v) for v in r.ineqlin.marginals]
+        duals['variable_reduced_costs']=[float(v) for v in (r.lower.marginals if getattr(r.lower,'marginals',None) is not None else [0.0]*n)]
+    return {'status':'OPTIMAL','x':x.tolist(),'objective':objective,'max_constraint_violation':residual,
+            'max_integer_violation':integ,'numeric_valid':residual<1e-6 and integ<1e-6,
+            'solver_gap':float(r.mip_gap) if getattr(r,'mip_gap',None) is not None else None,
+            **({'duals':duals} if duals else {}),
+            'warning':'Optimality applies to supplied formulation. Variable units and business assumptions require review.'}
 
-    c = np.zeros(nv)
-    for pi, p in enumerate(prods):
-        for t in range(nw):
-            c[V(pi, "I", t)] = p.get("holding_cost", 1.0)
-            c[V(pi, "U", t)] = p.get("backlog_cost", 100.0)
-            if p.get("conversion_cost"):
-                c[V(pi, "P", t)] = p["conversion_cost"]
-
-    A_ub, b_ub, tags = [], [], []
-    for r in res:
-        for t in range(nw):
-            row = np.zeros(nv)
-            for pi, p in enumerate(prods):
-                mins = p.get("resources", {}).get(r["id"], 0.0)
-                if mins:
-                    row[V(pi, "P", t)] = mins
-            A_ub.append(row)
-            b_ub.append(r["capacity"][t])
-            tags.append(f"res:{r['id']}:{t}")
-    for pi, p in enumerate(prods):
-        for t in range(nw):
-            if p.get("production_limit"):
-                row = np.zeros(nv)
-                row[V(pi, "P", t)] = 1.0
-                A_ub.append(row)
-                b_ub.append(p["production_limit"][t])
-                tags.append(f"lim:{p['id']}:{t}")
-    if mode == "service":
-        for pi in range(npd):
-            for t in range(nw):
-                row = np.zeros(nv)
-                row[V(pi, "U", t)] = 1.0
-                A_ub.append(row)
-                b_ub.append(0.0)
-                tags.append(f"nobacklog:{prods[pi]['id']}:{t}")
-
-    A_eq, b_eq = [], []
-    for pi, p in enumerate(prods):
-        for t in range(nw):
-            row = np.zeros(nv)
-            row[V(pi, "P", t)] = 1.0
-            row[V(pi, "I", t)] = -1.0
-            row[V(pi, "U", t)] = 1.0
-            if t > 0:
-                row[V(pi, "I", t - 1)] = 1.0
-                row[V(pi, "U", t - 1)] = -1.0
-            A_eq.append(row)
-            b_eq.append(p["demand"][t])
-
-    out = linprog(c, A_ub=np.array(A_ub), b_ub=np.array(b_ub),
-                  A_eq=np.array(A_eq), b_eq=np.array(b_eq),
-                  bounds=[(0, None)] * nv, method="highs")
-    if out.status != 0:
-        return {"status": "ERROR", "message": out.message}
-    duals = {tag: round(float(-out.ineqlin.marginals[i]), 4) for i, tag in enumerate(tags)}
-    result = {"status": "OPTIMAL", "mode": mode, "periods": periods,
-              "objective": round(float(out.fun), 2), "products": {}, "resources": {},
-              "resource_shadow_prices": duals}
-    for pi, p in enumerate(prods):
-        result["products"][p["id"]] = {
-            "production": [round(out.x[V(pi, "P", t)], 1) for t in range(nw)],
-            "inventory": [round(out.x[V(pi, "I", t)], 1) for t in range(nw)],
-            "backlog": [round(out.x[V(pi, "U", t)], 1) for t in range(nw)],
-        }
-    for r in res:
-        loads = [sum(p.get("resources", {}).get(r["id"], 0.0) * out.x[V(pi, "P", t)]
-                     for pi, p in enumerate(prods)) for t in range(nw)]
-        result["resources"][r["id"]] = {
-            "capacity": r["capacity"],
-            "load": [round(v, 1) for v in loads],
-            "utilisation": [round(v / cap, 4) if cap else 0 for v, cap in zip(loads, r["capacity"])],
-        }
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Engine 2: rough_cut — load-vs-capacity screen for a proposed plan
-# ---------------------------------------------------------------------------
-
-def rough_cut(data: dict, proposed_production: dict[str, list[float]]) -> dict:
-    """Screen a proposed production plan against shared-resource capacity."""
-    prods = data["products"]
-    res = data["resources"]
-    periods = data["periods"]
-    rows = []
-    for r in res:
-        for t, per in enumerate(periods):
-            load = sum(p.get("resources", {}).get(r["id"], 0.0)
-                       * proposed_production.get(p["id"], [0] * len(periods))[t]
-                       for p in prods)
-            cap = r["capacity"][t]
-            rows.append({"resource": r["id"], "period": per,
-                         "load": round(load, 1), "capacity": cap,
-                         "utilisation_pct": round(100 * load / cap, 1) if cap else None,
-                         "overloaded": load > cap + 1e-6,
-                         "shortfall": round(max(0.0, load - cap), 1)})
-    return {"status": "OK", "rows": rows,
-            "any_overload": any(x["overloaded"] for x in rows)}
-
-
-# ---------------------------------------------------------------------------
-# Engine 3: mrp_run — BOM explosion with net requirements and lot sizing
-# ---------------------------------------------------------------------------
-
-def mrp_run(data: dict, lot_size: str = "lot_for_lot", fixed_qty: float = 0.0) -> dict:
-    """Explode product demand through each product's BOM into part-level
-    gross/net requirements and planned orders (lot-for-lot or fixed qty)."""
-    prods = data["products"]
-    periods = data["periods"]
-    nw = len(periods)
-    parts: dict[str, list[tuple[str, float]]] = {}
-    for p in prods:
-        for part, qty in p.get("bom", {}).items():
-            parts.setdefault(part, []).append((p["id"], qty))
-    result = {}
-    for part, parents in parts.items():
-        gross = [0.0] * nw
-        for pid, qty in parents:
-            prod = next(x for x in prods if x["id"] == pid)
-            for t in range(nw):
-                gross[t] += qty * prod["demand"][t]
-        on_hand = 0.0
-        net, orders, ending = [], [], []
-        for t in range(nw):
-            available = on_hand
-            netreq = max(0.0, gross[t] - available)
-            net.append(round(netreq, 1))
-            order = fixed_qty if (lot_size == "fixed" and netreq > 0) else netreq
-            orders.append(round(order, 1))
-            on_hand = available + order - gross[t]
-            ending.append(round(on_hand, 1))
-        result[part] = {"gross_requirements": [round(g, 1) for g in gross],
-                        "net_requirements": net, "planned_orders": orders,
-                        "ending_inventory": ending}
-    return {"status": "OK", "lot_size": lot_size, "parts": result}
-
-
-# ---------------------------------------------------------------------------
-# Engine 4: inventory_policy — newsvendor / safety stock / reorder point
-# ---------------------------------------------------------------------------
-
-def inventory_policy(policy: str = "newsvendor", service_level: float = 0.95,
-                     demand_std: float = 0.0, lead_time: int = 1,
-                     unit_cost: float = 10.0, selling_price: float = 15.0,
-                     salvage: float = 5.0) -> dict:
-    """Newsvendor critical-ratio sizing, or safety stock / reorder point."""
-    from scipy.stats import norm
-    if policy == "newsvendor":
-        cu = selling_price - unit_cost
-        co = unit_cost - salvage
-        ratio = cu / (cu + co) if cu + co > 0 else 0.0
-        q = float(norm.ppf(ratio)) * demand_std if demand_std > 0 else 0.0
-        return {"policy": "newsvendor", "critical_ratio": round(ratio, 4),
-                "order_quantity": round(q, 1), "underage_cost": round(cu, 2),
-                "overage_cost": round(co, 2)}
-    z = float(norm.ppf(service_level))
-    ss = z * demand_std * (lead_time ** 0.5)
-    return {"policy": policy, "service_level": service_level, "z": round(z, 4),
-            "safety_stock": round(ss, 1), "reorder_point": round(ss + demand_std * lead_time, 1)}
-
-
-# ---------------------------------------------------------------------------
-# Engine 5: plan_pnl — one-set-of-numbers finance view for a plan
-# ---------------------------------------------------------------------------
-
-def plan_pnl(data: dict, plan: dict) -> dict:
-    """Revenue, conversion/holding/backlog cost and margin for a plan."""
-    nw = len(data["periods"])
-    revenue = conv = hold = back = 0.0
-    for p in data["products"]:
-        path = plan["products"].get(p["id"], {})
-        for t in range(nw):
-            produced = path.get("production", [0] * nw)[t]
-            inv = path.get("inventory", [0] * nw)[t]
-            backl = path.get("backlog", [0] * nw)[t]
-            revenue += produced * p.get("selling_price", 0.0)
-            conv += produced * p.get("conversion_cost", 0.0)
-            hold += inv * p.get("holding_cost", 0.0)
-            back += backl * p.get("backlog_cost", 0.0)
-    total_cost = conv + hold + back
-    margin = revenue - total_cost
-    return {"revenue": round(revenue, 2), "conversion_cost": round(conv, 2),
-            "holding_cost": round(hold, 2), "backlog_cost": round(back, 2),
-            "total_cost": round(total_cost, 2), "margin": round(margin, 2),
-            "margin_pct": round(100 * margin / revenue, 2) if revenue else 0.0}
-
-
-# ---------------------------------------------------------------------------
-# Engine 6: simulate — template shock scenarios with re-optimization
-# ---------------------------------------------------------------------------
-
-def simulate(data: dict, shocks: dict) -> dict:
-    """Re-plan under demand / capacity shocks (shallow-copied, never mutates input)."""
-    import copy
-    d = copy.deepcopy(data)
-    dm = shocks.get("demand_multiplier", 1.0)
-    cm = shocks.get("capacity_multiplier", 1.0)
-    if dm != 1.0:
-        for p in d["products"]:
-            p["demand"] = [round(v * dm, 1) for v in p["demand"]]
-    if cm != 1.0:
-        for r in d["resources"]:
-            r["capacity"] = [round(v * cm, 1) for v in r["capacity"]]
-    result = plan_multi_period(d)
-    result["shocks_applied"] = {"demand_multiplier": dm, "capacity_multiplier": cm}
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Engine 7: forecast_ladder — naive/SMA/SES/Holt selected by rolling-origin MAE
-# ---------------------------------------------------------------------------
-
-def forecast_ladder(history: list[float], horizon: int = 4) -> dict:
-    h = list(history)
-    candidates = {"naive": lambda s: s[-1]}
-    candidates["sma3"] = lambda s: sum(s[-3:]) / 3 if len(s) >= 3 else s[-1]
-
-    def ses(s, alpha=0.3):
-        f = s[0]
-        for v in s[1:]:
-            f = alpha * v + (1 - alpha) * f
-        return f
-    candidates["ses0.3"] = ses
-
-    def holt(s, alpha=0.3, beta=0.1):
-        level, trend = s[0], s[1] - s[0]
-        for v in s[1:]:
-            new_level = alpha * v + (1 - alpha) * (level + trend)
-            trend = beta * (new_level - level) + (1 - beta) * trend
-            level = new_level
-        return level + trend
-    candidates["holt"] = holt
-
-    mae = {}
-    for name, fn in candidates.items():
-        errors = []
-        for i in range(max(2, len(h) - 3), len(h)):
-            errors.append(abs(fn(h[:i]) - h[i]))
-        mae[name] = round(sum(errors) / len(errors), 3) if errors else None
-    best = min((v, k) for k, v in mae.items() if v is not None)[1]
-    return {"mae": mae, "selected": best,
-            "forecast": [round(candidates[best](h), 1)] * horizon}
-
-
-# ---------------------------------------------------------------------------
-# Jev gate — decide when a planning question is confident enough to act
-# ---------------------------------------------------------------------------
-
-@dataclass
-class JevCriteria:
-    confidence: float          # model confidence in the chosen action
-    probability: float         # estimated probability the action succeeds
-    margin: float              # margin between top action and runner-up
-    evidence_count: int        # supporting evidence records
-    blockers: list[str] = field(default_factory=list)
-
-
-def jev_evaluate(criteria: JevCriteria, gates: dict | None = None) -> dict:
-    """The Jev decision gate, exactly as it behaved in the Wooden Space solve.
-
-    Gates: confidence >= 0.85, probability >= 0.85, margin >= 0.2,
-    evidence_count >= 2, no blockers. Pass = act; fail = ESCALATE_REASONING
-    (ask the operator / run more analysis before acting).
-    """
-    g = gates or {}
-    checks = {
-        "confidence": criteria.confidence >= g.get("min_confidence", 0.85),
-        "probability": criteria.probability >= g.get("min_probability", 0.85),
-        "margin": criteria.margin >= g.get("min_margin", 0.2),
-        "evidence": criteria.evidence_count >= g.get("min_evidence", 2),
-        "blockers": len(criteria.blockers) == 0,
-    }
-    passed = all(checks.values())
-    return {"gates_passed": passed, "checks": checks,
-            "action_taken": "ACT" if passed else "ESCALATE_REASONING",
-            "criteria": {"confidence": criteria.confidence, "probability": criteria.probability,
-                         "margin": criteria.margin, "evidence_count": criteria.evidence_count,
-                         "blockers": criteria.blockers}}
+def run(method,i,timeout=30):
+    if method=='formula':return formula(i)
+    if method=='sensitivity':
+        scenarios=i['scenarios']
+        if not isinstance(scenarios,list) or not 1<=len(scenarios)<=100:raise ValueError('1–100 explicit scenarios required')
+        rows=[]
+        for s in scenarios:
+            params={**i['parameters'],**s['parameters']}
+            rows.append({'name':s['name'],**formula({'parameters':params,'expressions':i['expressions'],'checks':i.get('checks',[])})})
+        return {'scenarios':rows,'numeric_valid':all(r['numeric_valid'] for r in rows),'warning':'Scenarios have no assumed probabilities.'}
+    if method=='descriptive':
+        a=array(i['values'])
+        return {'count':len(a),'sum':float(a.sum()),'mean':float(a.mean()),'median':float(np.median(a)),
+                'sample_std':float(a.std(ddof=1)) if len(a)>1 else None,'min':float(a.min()),'max':float(a.max()),'numeric_valid':True}
+    if method=='cashflow':
+        cf=array(i['cashflows']);rate=scalar(i['discount_rate'])
+        if rate<=-1:raise ValueError('discount rate must exceed -1')
+        if len(cf)>1000:raise ValueError('horizon too large')
+        t=np.arange(len(cf));discount=cf/((1+rate)**t);cum=cf.cumsum()
+        if not np.isfinite(discount).all():raise ValueError('discounting overflow; revise rate/horizon')
+        crossings=np.flatnonzero(cum>=0)
+        payback=int(crossings[0]) if len(crossings) and cf[0]<0 else None
+        return {'npv':float(discount.sum()),'discounted_cashflows':discount.tolist(),'cumulative_cash':cum.tolist(),
+            'peak_cumulative_funding':float(max(0,-cum.min())),'first_nonnegative_cash_bucket':payback,
+            'numeric_valid':True,'basis':'First cashflow is t=0; equal periods; no taxes/terminal value invented. Crossing is discrete, not interpolated payback.'}
+    if method in ['linear_program','milp']:return linear(i,method=='milp',timeout)
+    if method=='welch_ttest':
+        a=array(i['a']);b=array(i['b']);alpha=scalar(i.get('alpha',.05))
+        if len(a)<2 or len(b)<2 or not 0<alpha<1:raise ValueError('need >=2 observations/sample and valid alpha')
+        va=a.var(ddof=1)/len(a);vb=b.var(ddof=1)/len(b)
+        if va+vb==0:raise ValueError('zero variance; inferential test not defined here')
+        se=math.sqrt(va+vb);df=(va+vb)**2/(va**2/(len(a)-1)+vb**2/(len(b)-1));diff=float(a.mean()-b.mean())
+        stat=diff/se;p=float(2*stats.t.sf(abs(stat),df));crit=float(stats.t.ppf(1-alpha/2,df))
+        return {'mean_difference':diff,'t':stat,'degrees_freedom':float(df),'p_value_two_sided':p,
+            'confidence_interval':[diff-crit*se,diff+crit*se],'alpha':alpha,'numeric_valid':True,
+            'warning':'Requires independent observations and defensible sampling. No causal claim or multiple-testing correction is implied.'}
+    if method=='ols':
+        x=array(i['x'],2);y=array(i['y']);x=np.column_stack([np.ones(len(x)),x])
+        if len(x)!=len(y) or len(y)<=x.shape[1]:raise ValueError('insufficient observations/dimension mismatch')
+        beta,_,rank,_=np.linalg.lstsq(x,y,rcond=None)
+        if rank!=x.shape[1]:raise ValueError('rank deficient design')
+        pred=x@beta;res=y-pred;sse=float(res@res);sst=float(((y-y.mean())**2).sum())
+        return {'coefficients_with_intercept':beta.tolist(),'predictions':pred.tolist(),'residuals':res.tolist(),
+            'r_squared':1-sse/sst if sst else None,'max_normal_equation_residual':float(np.abs(x.T@res).max()),
+            'numeric_valid':True,'warning':'In-sample association only. No causal identification or predictive holdout evaluation.'}
+    if method=='forecast':
+        from .sop.forecast import forecast
+        return {**forecast(i['history'],i['horizon'],i.get('season',1)),'numeric_valid':True}
+    if method=='sop_plan':
+        from .sop.schema import PlanningInput
+        from .sop.optimizer import optimize
+        from .sop.critic import validate
+        from .sop.simulation import simulate
+        d=PlanningInput.model_validate(i['data']);p=optimize(d,i.get('mode','economic'));v=validate(d,p)
+        return {'plan':p,'validation':v,'simulation':simulate(d,p) if v['feasible'] else None,'numeric_valid':v['feasible']}
+    if method=='plan_multi_period':
+        from .sop.planner import plan_multi_period
+        return plan_multi_period(i['data'])
+    if method=='rough_cut':
+        from .sop.planner import rough_cut
+        return rough_cut(i['data'])
+    if method=='mrp_run':
+        from .sop.mrp import mrp_run
+        return mrp_run(i['data'])
+    if method=='inventory_policy':
+        from .sop.inventory import newsvendor, safety_stock, ss_policy_simulate
+        kind=i.get('policy','newsvendor')
+        if kind=='newsvendor':return newsvendor(i['data'])
+        if kind=='safety_stock':return safety_stock(i['data'])
+        if kind=='ss_policy':return ss_policy_simulate(i['data'])
+        raise ValueError("policy must be newsvendor, safety_stock or ss_policy")
+    if method=='plan_pnl':
+        from .sop.pnl import plan_pnl
+        return plan_pnl(i['data'])
+    if method=='simulate':
+        from .sop.pnl import simulate
+        return simulate(i)
+    if method=='holt':
+        from .sop.forecast import holt
+        return {**holt(i['history'],i['horizon'],i.get('alpha'),i.get('beta')),'numeric_valid':True}
+    if method=='holt_winters':
+        from .sop.forecast import holt_winters
+        return {**holt_winters(i['history'],i['horizon'],i.get('season',12),i.get('alpha'),i.get('beta'),i.get('gamma')),'numeric_valid':True}
+    if method=='forecast_ladder':
+        from .sop.forecast import ladder
+        return {**ladder(i['history'],i['horizon'],i.get('season',1)),'numeric_valid':True}
+    if method=='forecast_adjust':
+        from .sop.forecast import adjust
+        return adjust(i['forecast'],i['adjustments'],i.get('note',''))
+    if method=='forecast_track':
+        from .sop.forecast import track
+        return track(i['history'],i['forecast'])
+    if method=='arima':
+        from .sop.enterprise import arima
+        return {**arima(i['data']),'numeric_valid':True}
+    if method=='regression_forecast':
+        from .sop.enterprise import regression_forecast
+        return regression_forecast(i['data'])
+    if method=='multi_echelon_inventory':
+        from .sop.enterprise import multi_echelon_inventory
+        return multi_echelon_inventory(i['data'])
+    if method=='python_sandbox':
+        from .sandbox import execute
+        return execute(i,timeout)
+    raise ValueError('UNSUPPORTED_CAPABILITY')
